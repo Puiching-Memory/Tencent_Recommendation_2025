@@ -1,8 +1,12 @@
 # TenCent_Recommendation_2025
 
-默认模型精度：
-```
-Score: 0.0267527
-NDCG@10: 0.0206547
-HitRate@10: 0.0403256
+## 环境
+参考系统:windows11 CUDA 12.9 NVIDIA 4060Ti sm
+
+```bash
+conda create -n rs python=3.13
+conda activate rs
+
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+pip install -r requirements.txt
 ```
