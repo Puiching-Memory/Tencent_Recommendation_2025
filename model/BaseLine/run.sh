@@ -5,7 +5,4 @@ echo ${RUNTIME_SCRIPT_DIR}
 # enter train workspace
 cd ${RUNTIME_SCRIPT_DIR}
 
-python -u main.py 
-
-# for local dev
-# python -u ./model/BaseLine/main.py --batch_size 2
+python -u main.py --use_amp --use_compile --enable_tf32 --num_workers 8

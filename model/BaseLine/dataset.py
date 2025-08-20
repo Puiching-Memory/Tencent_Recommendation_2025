@@ -38,7 +38,6 @@ class MyDataset(torch.utils.data.Dataset):
         """
         super().__init__()
         self.data_dir = Path(data_dir)
-        self._load_data_and_offsets()
         self.maxlen = args.maxlen
         self.mm_emb_ids = args.mm_emb_id
 
@@ -52,15 +51,11 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
 
-        self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-
-    def _load_data_and_offsets(self):
-        """
-        加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
-        """
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
-        with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
+        # 预加载偏移量数据
+        with open(self.data_dir / 'seq_offsets.pkl', 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+        self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
     def _load_user_data(self, uid):
         """
@@ -72,10 +67,14 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
-        self.data_file.seek(self.seq_offsets[uid])
-        line = self.data_file.readline()
-        data = json.loads(line)
+        # 每次都打开文件并读取数据，确保多进程安全
+        with open(self.data_dir / "seq.jsonl", 'rb') as data_file:
+            data_file.seek(self.seq_offsets[uid])
+            line = data_file.readline()
+            data = json.loads(line)
         return data
+
+    # _load_user_data 方法已移至上一修改块
 
     def _random_neq(self, l, r, s):
         """
@@ -301,11 +300,26 @@ class MyTestDataset(MyDataset):
 
     def __init__(self, data_dir, args):
         super().__init__(data_dir, args)
-
-    def _load_data_and_offsets(self):
-        self.data_file = open(self.data_dir / "predict_seq.jsonl", 'rb')
-        with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
+        # 预加载测试偏移量数据
+        with open(self.data_dir / 'predict_seq_offsets.pkl', 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+    def _load_user_data(self, uid):
+        """
+        从数据文件中加载单个用户的数据
+
+        Args:
+            uid: 用户ID(reid)
+
+        Returns:
+            data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
+        """
+        # 每次都打开文件并读取数据，确保多进程安全
+        with open(self.data_dir / "predict_seq.jsonl", 'rb') as data_file:
+            data_file.seek(self.seq_offsets[uid])
+            line = data_file.readline()
+            data = json.loads(line)
+        return data
 
     def _process_cold_start_feat(self, feat):
         """

@@ -11,4 +11,4 @@ New-Item -ItemType Directory -Path $env:TRAIN_DATA_PATH -Force | Out-Null
 New-Item -ItemType Directory -Path $env:TRAIN_CKPT_PATH -Force | Out-Null
 
 # 运行主程序
-python -u ./model/BaseLine/main.py --batch_size 2
+python -u ./model/BaseLine/main.py --batch_size 16 --mm_emb_id 81 82 83 84 85 86

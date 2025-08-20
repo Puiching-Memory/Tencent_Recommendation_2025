@@ -29,6 +29,7 @@ def get_args():
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
+    parser.add_argument('--num_workers', default=4, type=int, help='Number of workers for data loading')
 
     # Baseline Model construction
     parser.add_argument('--hidden_units', default=64, type=int)
@@ -144,7 +145,7 @@ def infer():
     data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=test_dataset.collate_fn, persistent_workers=True
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
