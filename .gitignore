@@ -1,4 +1,7 @@
 data/
 __pycache__/
+checkpoints/
+tf_events/
+logs/
 *.pdf
 *.pyc
