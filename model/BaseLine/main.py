@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import MyDataset
 from model import BaselineModel
+from utils import print_system_info
 
 
 def get_args():
@@ -41,6 +42,7 @@ def get_args():
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision')
     parser.add_argument('--use_compile', action='store_true', help='Compile model with torch.compile')
     parser.add_argument('--enable_tf32', action='store_true', help='Enable TF32 format for faster computations')
+    parser.add_argument('--cudnn_deterministic', action='store_true', help='Use deterministic CuDNN operations (slower but reproducible)')
 
     args = parser.parse_args()
 
@@ -55,6 +57,9 @@ if __name__ == '__main__':
     # global dataset
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
+    # 获取并显示系统资源信息
+    print_system_info()
+
     args = get_args()
     
     # Enable TF32 for faster training on Ampere GPUs
@@ -62,6 +67,17 @@ if __name__ == '__main__':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         print("TF32 enabled for faster training")
+    
+    # Enable CuDNN benchmark for faster training
+    if torch.cuda.is_available():
+        if args.cudnn_deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            print("CuDNN deterministic mode enabled for reproducible results")
+        else:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            print("CuDNN benchmark enabled for faster training")
 
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
@@ -198,7 +214,7 @@ if __name__ == '__main__':
             log_file.write(log_json + '\n')
             log_file.flush()
             
-                # Print progress every 10 steps
+            # Print progress every 10 steps
             if step % 10 == 0:
                 progress = (step + 1) / len(train_loader) * 100
                 print(f"  Step {step+1}/{len(train_loader)} [{progress:.1f}%] - "
