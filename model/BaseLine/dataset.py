@@ -299,10 +299,26 @@ class MyTestDataset(MyDataset):
     """
 
     def __init__(self, data_dir, args):
-        super().__init__(data_dir, args)
-        # 预加载测试偏移量数据
+        # 直接初始化父类的部分属性，避免调用父类的__init__方法加载seq_offsets.pkl
+        self.data_dir = Path(data_dir)
+        self.maxlen = args.maxlen
+        self.mm_emb_ids = args.mm_emb_id
+
+        self.item_feat_dict = json.load(open(Path(data_dir, "item_feat_dict.json"), 'r'))
+        self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_ids)
+        with open(self.data_dir / 'indexer.pkl', 'rb') as ff:
+            indexer = pickle.load(ff)
+            self.itemnum = len(indexer['i'])
+            self.usernum = len(indexer['u'])
+        self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
+        self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
+        self.indexer = indexer
+
+        # 加载测试偏移量数据
         with open(self.data_dir / 'predict_seq_offsets.pkl', 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+        self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
     def _load_user_data(self, uid):
         """

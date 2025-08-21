@@ -2,12 +2,12 @@ import argparse
 import json
 import os
 import struct
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
 from model import BaselineModel
@@ -29,13 +29,13 @@ def get_args():
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--num_workers', default=4, type=int, help='Number of workers for data loading')
+    parser.add_argument('--num_workers', default=1, type=int, help='Number of workers for data loading')
 
     # Baseline Model construction
-    parser.add_argument('--hidden_units', default=64, type=int)
-    parser.add_argument('--num_blocks', default=2, type=int)
+    parser.add_argument('--hidden_units', default=32, type=int)
+    parser.add_argument('--num_blocks', default=1, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_heads', default=1, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
@@ -45,6 +45,12 @@ def get_args():
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+
+    # Training acceleration (默认开启)
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision', default=True)
+    parser.add_argument('--use_compile', action='store_true', help='Compile model with torch.compile', default=True)
+    parser.add_argument('--enable_tf32', action='store_true', help='Enable TF32 format for faster computations', default=True)
+    parser.add_argument('--cudnn_deterministic', action='store_true', help='Use deterministic CuDNN operations (slower but reproducible)')
 
     args = parser.parse_args()
 
@@ -142,31 +148,105 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
 
 def infer():
     args = get_args()
+    
+    # Enable TF32 for faster training on Ampere GPUs (默认启用)
+    if args.enable_tf32 is not False and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("TF32 enabled for faster training")
+    
+    # Enable CuDNN benchmark for faster training
+    if torch.cuda.is_available():
+        if args.cudnn_deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            print("CuDNN deterministic mode enabled for reproducible results")
+        else:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            print("CuDNN benchmark enabled for faster training")
+            
     data_path = os.environ.get('EVAL_DATA_PATH')
+    print(f"Loading test dataset from {data_path}")
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=test_dataset.collate_fn, persistent_workers=True
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
+    print(f"Dataset loaded: {len(test_dataset)} users, {itemnum} items")
+    
+    print(f"Creating model with hidden_units={args.hidden_units}, num_blocks={args.num_blocks}, num_heads={args.num_heads}")
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    
+    # Compile model for faster execution (默认启用)
+    if args.use_compile is not False:
+        try:
+            model = torch.compile(model)
+            print("Model compiled successfully")
+        except Exception as e:
+            print(f"Failed to compile model: {e}")
+            
     model.eval()
+    print("Model set to evaluation mode")
 
     ckpt_path = get_ckpt_path()
+    print(f"Loading checkpoint from {ckpt_path}")
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
+    print("Checkpoint loaded successfully")
+    
     all_embs = []
     user_list = []
-    for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
-
+    
+    # Scaler for AMP (默认启用)
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.use_amp is not False)) if torch.cuda.is_available() else torch.amp.GradScaler('cpu', enabled=(args.use_amp is not False))
+    if args.use_amp is not False:
+        print("Automatic Mixed Precision (AMP) enabled")
+        
+    print(f"Starting inference with batch_size={args.batch_size}")
+    start_time = time.time()
+    
+    for step, batch in enumerate(test_loader):
         seq, token_type, seq_feat, user_id = batch
         seq = seq.to(args.device)
-        logits = model.predict(seq, seq_feat, token_type)
+        
+        # Use AMP context manager (默认启用)
+        with torch.amp.autocast('cuda', enabled=(args.use_amp is not False)):
+            logits = model.predict(seq, seq_feat, token_type)
+            
         for i in range(logits.shape[0]):
             emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
             all_embs.append(emb)
         user_list += user_id
+        
+        # Print progress every 10 steps
+        if step % 10 == 0:
+            elapsed_time = time.time() - start_time
+            progress = (step + 1) / len(test_loader) * 100
+            steps_per_second = (step + 1) / elapsed_time if elapsed_time > 0 else 0
+            
+            # Calculate estimated remaining time
+            remaining_steps = len(test_loader) - (step + 1)
+            estimated_remaining_time = remaining_steps / steps_per_second if steps_per_second > 0 else 0
+            
+            # Format time for display
+            def format_time(seconds):
+                if seconds < 60:
+                    return f"{seconds:.1f}s"
+                elif seconds < 3600:
+                    return f"{seconds/60:.1f}m"
+                else:
+                    return f"{seconds/3600:.1f}h"
+            
+            print(f"  Step {step+1}/{len(test_loader)} [{progress:.1f}%] - "
+                  f"Speed: {steps_per_second:.2f} steps/s, "
+                  f"ETA: {format_time(estimated_remaining_time)}")
+
+    total_time = time.time() - start_time
+    print(f"Inference completed in {total_time:.2f} seconds ({len(test_loader)/total_time:.2f} steps/s)")
 
     # 生成候选库的embedding 以及 id文件
+    print("Generating candidate embeddings")
     retrieve_id2creative_id = get_candidate_emb(
         test_dataset.indexer['i'],
         test_dataset.feature_types,
@@ -175,9 +255,15 @@ def infer():
         model,
     )
     all_embs = np.concatenate(all_embs, axis=0)
+    print("Candidate embeddings generated")
+    
     # 保存query文件
+    print("Saving query embeddings")
     save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
+    print("Query embeddings saved")
+    
     # ANN 检索
+    print("Performing ANN search")
     ann_cmd = (
         str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
         + " --dataset_vector_file_path="
@@ -190,15 +276,23 @@ def infer():
         + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
         + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
     )
+    print(f"Running ANN command: {ann_cmd}")
     os.system(ann_cmd)
+    print("ANN search completed")
 
     # 取出top-k
+    print("Processing results")
     top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
     top10s_untrimmed = []
-    for top10 in tqdm(top10s_retrieved):
+    for i, top10 in enumerate(top10s_retrieved):
+        # Print progress every 10 steps
+        if i % 10 == 0:
+            progress = (i + 1) / len(top10s_retrieved) * 100
+            print(f"  Processing results: {i+1}/{len(top10s_retrieved)} [{progress:.1f}%]")
         for item in top10:
             top10s_untrimmed.append(retrieve_id2creative_id.get(int(item), 0))
 
     top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
+    print("Results processed")
 
     return top10s, user_list
