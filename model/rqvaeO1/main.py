@@ -18,7 +18,7 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
@@ -42,6 +42,15 @@ def get_args():
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    
+    # RQ-VAE 参数
+    parser.add_argument('--rq_num_codebooks', default=4, type=int, help='Number of codebooks for RQ-VAE')
+    parser.add_argument('--rq_codebook_size', default=64, type=int, help='Codebook size for RQ-VAE')
+    parser.add_argument('--rq_shared_codebook', action='store_true', help='Whether to share codebooks in RQ-VAE')
+    parser.add_argument('--rq_kmeans_method', default='kmeans', type=str, choices=['kmeans', 'bkmeans'], help='K-means method for RQ-VAE')
+    parser.add_argument('--rq_kmeans_iters', default=100, type=int, help='K-means iterations for RQ-VAE')
+    parser.add_argument('--rq_distances_method', default='l2', type=str, choices=['l2', 'cosine'], help='Distance method for RQ-VAE')
+    parser.add_argument('--rq_loss_beta', default=0.25, type=float, help='Loss beta for RQ-VAE')
 
     args = parser.parse_args()
 

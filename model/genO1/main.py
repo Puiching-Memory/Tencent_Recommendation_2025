@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import MyDataset
-from model import BaselineModel
+from model import GenerativeRecommender
 from utils import print_system_info, format_time
 
 
@@ -18,15 +18,15 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
-    # Baseline Model construction
-    parser.add_argument('--hidden_units', default=64, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
-    parser.add_argument('--num_epochs', default=5, type=int)
+    # HSTU Model construction
+    parser.add_argument('--embedding_dim', default=64, type=int)
+    parser.add_argument('--num_layers', default=2, type=int)
     parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_epochs', default=5, type=int)
     parser.add_argument('--dropout_rate', default=0.01, type=float)
     parser.add_argument('--l2_emb', default=0.001, type=float)
     parser.add_argument('--device', default='cuda', type=str)
@@ -89,7 +89,17 @@ if __name__ == '__main__':
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = GenerativeRecommender(
+        num_users=usernum,
+        num_items=itemnum,
+        embedding_dim=args.embedding_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        dropout_rate=args.dropout_rate,
+        maxlen=args.maxlen,
+        feat_statistics=feat_statistics,
+        feat_types=feat_types
+    ).to(args.device)
 
     for name, param in model.named_parameters():
         try:
@@ -97,9 +107,9 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    model.pos_emb.weight.data[0, :] = 0
-    model.item_emb.weight.data[0, :] = 0
-    model.user_emb.weight.data[0, :] = 0
+    model.positional_embedding.weight.data[0, :] = 0
+    model.item_embedding.weight.data[0, :] = 0
+    model.user_embedding.weight.data[0, :] = 0
 
     for k in model.sparse_emb:
         model.sparse_emb[k].weight.data[0, :] = 0
@@ -175,7 +185,7 @@ if __name__ == '__main__':
                 loss = bce_criterion(pos_logits[indices], pos_labels[indices])
                 loss += bce_criterion(neg_logits[indices], neg_labels[indices])
 
-                for param in model.item_emb.parameters():
+                for param in model.item_embedding.parameters():
                     loss += args.l2_emb * torch.norm(param)
 
             # Scale loss and backward

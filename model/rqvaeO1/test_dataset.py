@@ -38,6 +38,27 @@ class MyTestDataset(MyDataset):
                 processed_feat[feat_id] = feat_value
         return processed_feat
 
+    def _process_rqvae_semantic_id(self, feat, semantic_id):
+        """
+        处理RQ-VAE语义ID，将其集成到特征中
+        
+        Args:
+            feat: 原始特征字典
+            semantic_id: RQ-VAE语义ID
+            
+        Returns:
+            processed_feat: 处理后的特征字典，包含语义ID信息
+        """
+        # 这里实现具体的RQ-VAE语义ID处理逻辑
+        # 可以将semantic_id作为一个新的特征维度加入
+        # 或者根据语义ID调整现有特征的值
+        processed_feat = feat.copy()
+        
+        # 示例：添加一个语义ID特征
+        processed_feat['semantic_id'] = semantic_id
+        
+        return processed_feat
+
     def __getitem__(self, uid):
         """
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
@@ -72,7 +93,10 @@ class MyTestDataset(MyDataset):
                 if i > self.itemnum:
                     i = 0
                 if item_feat:
+                    # 获取RQ-VAE语义ID，这里需要根据实际情况实现
+                    semantic_id = self._get_rqvae_semantic_id(i)  # 假设有一个方法获取语义ID
                     item_feat = self._process_cold_start_feat(item_feat)
+                    item_feat = self._process_rqvae_semantic_id(item_feat, semantic_id)
                 ext_user_sequence.append((i, item_feat, 1))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)

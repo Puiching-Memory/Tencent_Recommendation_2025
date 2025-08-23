@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from dataset import MyTestDataset, save_emb
 from model import BaselineModel
 
+
 def get_ckpt_path():
     ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
     if ckpt_path is None:
@@ -23,25 +24,34 @@ def get_ckpt_path():
 def get_args():
     parser = argparse.ArgumentParser()
 
-    # Inference params
+    # Train params
     parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--hidden_units', default=64, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--hidden_units', default=32, type=int)
+    parser.add_argument('--num_blocks', default=1, type=int)
+    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_heads', default=1, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
+    parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
-
-    # Acceleration options for inference
-    parser.add_argument('--use_amp', action='store_true', help='Enable automatic mixed precision (AMP)',default=True)
-    parser.add_argument('--use_torch_compile', action='store_true', help='Enable torch.compile for model optimization',default=True)
-    parser.add_argument('--use_cudnn_benchmark', action='store_true', help='Enable cuDNN benchmark for performance',default=True)
-    parser.add_argument('--use_tf32', action='store_true', help='Enable TF32 for faster float32 computations',default=True)
+    parser.add_argument('--inference_only', action='store_true')
+    parser.add_argument('--state_dict_path', default=None, type=str)
+    parser.add_argument('--norm_first', action='store_true')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    
+    # RQ-VAE 参数
+    parser.add_argument('--rq_num_codebooks', default=4, type=int, help='Number of codebooks for RQ-VAE')
+    parser.add_argument('--rq_codebook_size', default=64, type=int, help='Codebook size for RQ-VAE')
+    parser.add_argument('--rq_shared_codebook', action='store_true', help='Whether to share codebooks in RQ-VAE')
+    parser.add_argument('--rq_kmeans_method', default='kmeans', type=str, choices=['kmeans', 'bkmeans'], help='K-means method for RQ-VAE')
+    parser.add_argument('--rq_kmeans_iters', default=100, type=int, help='K-means iterations for RQ-VAE')
+    parser.add_argument('--rq_distances_method', default='l2', type=str, choices=['l2', 'cosine'], help='Distance method for RQ-VAE')
+    parser.add_argument('--rq_loss_beta', default=0.25, type=float, help='Loss beta for RQ-VAE')
 
     args = parser.parse_args()
 
@@ -140,63 +150,28 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
 def infer():
     args = get_args()
     data_path = os.environ.get('EVAL_DATA_PATH')
-    
-    # Enable cuDNN benchmark
-    if args.use_cudnn_benchmark:
-        torch.backends.cudnn.benchmark = True
-        print("cuDNN benchmark enabled")
-    
-    # Enable TF32
-    if args.use_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("TF32 enabled")
-
     test_dataset = MyTestDataset(data_path, args)
-    
-    # Compile collate_fn if enabled
-    if args.use_torch_compile:
-        test_collate_fn = torch.compile(test_dataset.collate_fn, mode="reduce-overhead")
-        print("DataLoader collate function compiled with torch.compile")
-    else:
-        test_collate_fn = test_dataset.collate_fn
-    
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_collate_fn
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
     model.eval()
 
-    # Compile model if enabled
-    if args.use_torch_compile:
-        model = torch.compile(model)
-        print("Model compiled with torch.compile")
-
     ckpt_path = get_ckpt_path()
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
     all_embs = []
     user_list = []
-    
-    if args.use_amp:
-        print("Automatic Mixed Precision (AMP) enabled")
-    
-    print("Start inference")
-    
-    with torch.inference_mode():
-        for step, batch in enumerate(test_loader):
-            seq, token_type, seq_feat, user_id = batch
-            seq = seq.to(args.device)
-            
-            # Use AMP context manager
-            with torch.amp.autocast('cuda', enabled=args.use_amp):
-                logits = model.predict(seq, seq_feat, token_type)
-                    
-            for i in range(logits.shape[0]):
-                emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
-                all_embs.append(emb)
-            user_list += user_id
+    for step, batch in enumerate(test_loader):
+
+        seq, token_type, seq_feat, user_id = batch
+        seq = seq.to(args.device)
+        logits = model.predict(seq, seq_feat, token_type)
+        for i in range(logits.shape[0]):
+            emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
+            all_embs.append(emb)
+        user_list += user_id
 
     # 生成候选库的embedding 以及 id文件
     retrieve_id2creative_id = get_candidate_emb(
