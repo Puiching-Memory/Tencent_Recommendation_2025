@@ -59,3 +59,12 @@ def print_system_info():
             print(f"  GPU {i}: {name} ({memory_total} GB 总显存, {memory_used} GB 已使用)")
 
     print("=" * 50)
+
+# Time formatting function
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -325,7 +324,7 @@ def load_mm_emb(mm_path, feat_ids):
     """
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
-    for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
+    for feat_id in feat_ids:
         shape = SHAPE_DICT[feat_id]
         emb_dict = {}
         if feat_id != '81':

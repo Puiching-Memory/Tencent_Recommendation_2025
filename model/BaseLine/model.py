@@ -3,7 +3,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
 
 from dataset import save_emb
 
@@ -411,7 +410,7 @@ class BaselineModel(torch.nn.Module):
         """
         all_embs = []
 
-        for start_idx in tqdm(range(0, len(item_ids), batch_size), desc="Saving item embeddings"):
+        for start_idx in range(0, len(item_ids), batch_size):
             end_idx = min(start_idx + batch_size, len(item_ids))
 
             item_seq = torch.tensor(item_ids[start_idx:end_idx], device=self.dev).unsqueeze(0)

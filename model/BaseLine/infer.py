@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
 from model import BaselineModel
@@ -155,7 +154,7 @@ def infer():
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
     all_embs = []
     user_list = []
-    for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
+    for step, batch in enumerate(test_loader):
 
         seq, token_type, seq_feat, user_id = batch
         seq = seq.to(args.device)
@@ -194,7 +193,7 @@ def infer():
     # 取出top-k
     top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
     top10s_untrimmed = []
-    for top10 in tqdm(top10s_retrieved):
+    for top10 in top10s_retrieved:
         for item in top10:
             top10s_untrimmed.append(retrieve_id2creative_id.get(int(item), 0))
 
