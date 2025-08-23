@@ -21,12 +21,12 @@ def get_args():
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--num_workers', default=4, type=int, help='Number of workers for data loading')
+    parser.add_argument('--num_workers', default=8, type=int, help='Number of workers for data loading')
 
     # Baseline Model construction
     parser.add_argument('--hidden_units', default=32, type=int)
     parser.add_argument('--num_blocks', default=1, type=int)
-    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_epochs', default=5, type=int)
     parser.add_argument('--num_heads', default=1, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
@@ -41,7 +41,8 @@ def get_args():
     # Training acceleration
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision')
     parser.add_argument('--use_compile', action='store_true', help='Compile model with torch.compile')
-    parser.add_argument('--enable_tf32', action='store_true', help='Enable TF32 format for faster computations')
+    parser.add_argument('--enable_tf32_matmul', action='store_true', help='Enable TF32 format for matmul operations')
+    parser.add_argument('--enable_tf32_cudnn', action='store_true', help='Enable TF32 format for cuDNN operations')
     parser.add_argument('--cudnn_deterministic', action='store_true', help='Use deterministic CuDNN operations (slower but reproducible)')
 
     args = parser.parse_args()
@@ -59,14 +60,21 @@ if __name__ == '__main__':
 
     # 获取并显示系统资源信息
     print_system_info()
+    #import timm
+    #print(timm.__version__) # 1.0.16
 
     args = get_args()
     
     # Enable TF32 for faster training on Ampere GPUs
-    if args.enable_tf32 and torch.cuda.is_available() and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("TF32 enabled for faster training")
+    if torch.cuda.is_available():
+        # 设置float32矩阵乘法精度以启用Tensor核心
+        torch.set_float32_matmul_precision('high')
+        if args.enable_tf32_matmul:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            print("TF32 matmul enabled for faster training")
+        if args.enable_tf32_cudnn:
+            torch.backends.cudnn.allow_tf32 = True
+            print("TF32 cuDNN enabled for faster training")
     
     # Enable CuDNN benchmark for faster training
     if torch.cuda.is_available():
@@ -82,10 +90,10 @@ if __name__ == '__main__':
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=dataset.collate_fn, persistent_workers=True
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=dataset.collate_fn, persistent_workers=True, pin_memory=True
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=dataset.collate_fn, persistent_workers=True
+        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=dataset.collate_fn, persistent_workers=True, pin_memory=True
     )
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
@@ -155,10 +163,10 @@ if __name__ == '__main__':
         for step, batch in enumerate(train_loader):
             step_start_time = time.time()
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
-            seq = seq.to(args.device)
-            pos = pos.to(args.device)
-            neg = neg.to(args.device)
-            
+            seq = seq.to(args.device, non_blocking=True)
+            pos = pos.to(args.device, non_blocking=True)
+            neg = neg.to(args.device, non_blocking=True)
+
             # Use AMP context manager
             with torch.amp.autocast('cuda', enabled=args.use_amp):
                 pos_logits, neg_logits = model(
@@ -236,14 +244,14 @@ if __name__ == '__main__':
         valid_start_time = time.time()
         valid_steps = 0
         
-        with torch.no_grad():
+        with torch.inference_mode():
             print("Validating...")
             for step, batch in enumerate(valid_loader):
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
-                seq = seq.to(args.device)
-                pos = pos.to(args.device)
-                neg = neg.to(args.device)
-                
+                seq = seq.to(args.device, non_blocking=True)
+                pos = pos.to(args.device, non_blocking=True)
+                neg = neg.to(args.device, non_blocking=True)
+
                 # Use AMP context manager for validation
                 with torch.amp.autocast('cuda', enabled=args.use_amp):
                     pos_logits, neg_logits = model(

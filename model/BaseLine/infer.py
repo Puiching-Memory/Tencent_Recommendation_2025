@@ -36,7 +36,10 @@ def get_args():
     parser.add_argument('--num_blocks', default=1, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
     parser.add_argument('--num_heads', default=1, type=int)
-    parser.add_argument('--dropout_rate', default=0.2, type=float)
+    parser.add_argument('--dropout_rate', default=0.2, type=float, help='Default dropout rate')
+    parser.add_argument('--attention_dropout_rate', default=0.1, type=float, help='Attention layer dropout rate')
+    parser.add_argument('--ffn_dropout_rate', default=0.2, type=float, help='Feed Forward Network dropout rate')
+    parser.add_argument('--embedding_dropout_rate', default=0.1, type=float, help='Embedding dropout rate')
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
@@ -44,13 +47,14 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
 
     # MMemb Feature ID
-    parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    parser.add_argument('--mm_emb_id', nargs='+', default=['81','82'], type=str, choices=[str(s) for s in range(81, 87)])
 
-    # Training acceleration (默认开启)
-    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision', default=True)
-    parser.add_argument('--use_compile', action='store_true', help='Compile model with torch.compile', default=True)
-    parser.add_argument('--enable_tf32', action='store_true', help='Enable TF32 format for faster computations', default=True)
-    parser.add_argument('--cudnn_deterministic', action='store_true', help='Use deterministic CuDNN operations (slower but reproducible)')
+    # Inference acceleration
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision',default=True)
+    parser.add_argument('--use_compile', action='store_true', help='Compile model with torch.compile',default=True)
+    parser.add_argument('--enable_tf32_matmul', action='store_true', help='Enable TF32 format for matmul operations',default=False)
+    parser.add_argument('--enable_tf32_cudnn', action='store_true', help='Enable TF32 format for cuDNN operations',default=True)
+    parser.add_argument('--cudnn_deterministic', action='store_true', help='Use deterministic CuDNN operations (slower but reproducible)',default=False)
 
     args = parser.parse_args()
 
@@ -150,9 +154,11 @@ def infer():
     args = get_args()
     
     # Enable TF32 for faster training on Ampere GPUs (默认启用)
-    if args.enable_tf32 is not False and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    if (args.enable_tf32_matmul or args.enable_tf32_cudnn) and torch.cuda.is_available():
+        # 设置float32矩阵乘法精度以启用Tensor核心
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = args.enable_tf32_matmul
+        torch.backends.cudnn.allow_tf32 = args.enable_tf32_cudnn
         print("TF32 enabled for faster training")
     
     # Enable CuDNN benchmark for faster training
@@ -170,7 +176,7 @@ def infer():
     print(f"Loading test dataset from {data_path}")
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=test_dataset.collate_fn, persistent_workers=True
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=test_dataset.collate_fn, persistent_workers=True, pin_memory=True
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
@@ -206,41 +212,43 @@ def infer():
     print(f"Starting inference with batch_size={args.batch_size}")
     start_time = time.time()
     
-    for step, batch in enumerate(test_loader):
-        seq, token_type, seq_feat, user_id = batch
-        seq = seq.to(args.device)
-        
-        # Use AMP context manager (默认启用)
-        with torch.amp.autocast('cuda', enabled=(args.use_amp is not False)):
-            logits = model.predict(seq, seq_feat, token_type)
+    # Disable gradient computation and use inference mode for better performance
+    with torch.inference_mode():
+        for step, batch in enumerate(test_loader):
+            seq, token_type, seq_feat, user_id = batch
+            seq = seq.to(args.device, non_blocking=True)
             
-        for i in range(logits.shape[0]):
-            emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
-            all_embs.append(emb)
-        user_list += user_id
-        
-        # Print progress every 10 steps
-        if step % 10 == 0:
-            elapsed_time = time.time() - start_time
-            progress = (step + 1) / len(test_loader) * 100
-            steps_per_second = (step + 1) / elapsed_time if elapsed_time > 0 else 0
+            # Use AMP context manager (默认启用)
+            with torch.amp.autocast('cuda', enabled=(args.use_amp is not False)):
+                logits = model.predict(seq, seq_feat, token_type)
+
+            for i in range(logits.shape[0]):
+                emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
+                all_embs.append(emb)
+            user_list += user_id
             
-            # Calculate estimated remaining time
-            remaining_steps = len(test_loader) - (step + 1)
-            estimated_remaining_time = remaining_steps / steps_per_second if steps_per_second > 0 else 0
-            
-            # Format time for display
-            def format_time(seconds):
-                if seconds < 60:
-                    return f"{seconds:.1f}s"
-                elif seconds < 3600:
-                    return f"{seconds/60:.1f}m"
-                else:
-                    return f"{seconds/3600:.1f}h"
-            
-            print(f"  Step {step+1}/{len(test_loader)} [{progress:.1f}%] - "
-                  f"Speed: {steps_per_second:.2f} steps/s, "
-                  f"ETA: {format_time(estimated_remaining_time)}")
+            # Print progress every 10 steps
+            if step % 10 == 0:
+                elapsed_time = time.time() - start_time
+                progress = (step + 1) / len(test_loader) * 100
+                steps_per_second = (step + 1) / elapsed_time if elapsed_time > 0 else 0
+                
+                # Calculate estimated remaining time
+                remaining_steps = len(test_loader) - (step + 1)
+                estimated_remaining_time = remaining_steps / steps_per_second if steps_per_second > 0 else 0
+                
+                # Format time for display
+                def format_time(seconds):
+                    if seconds < 60:
+                        return f"{seconds:.1f}s"
+                    elif seconds < 3600:
+                        return f"{seconds/60:.1f}m"
+                    else:
+                        return f"{seconds/3600:.1f}h"
+                
+                print(f"  Step {step+1}/{len(test_loader)} [{progress:.1f}%] - "
+                    f"Speed: {steps_per_second:.2f} steps/s, "
+                    f"ETA: {format_time(estimated_remaining_time)}")
 
     total_time = time.time() - start_time
     print(f"Inference completed in {total_time:.2f} seconds ({len(test_loader)/total_time:.2f} steps/s)")
@@ -285,8 +293,8 @@ def infer():
     top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
     top10s_untrimmed = []
     for i, top10 in enumerate(top10s_retrieved):
-        # Print progress every 10 steps
-        if i % 10 == 0:
+        # Print progress every 1000 steps
+        if i % 1000 == 0:
             progress = (i + 1) / len(top10s_retrieved) * 100
             print(f"  Processing results: {i+1}/{len(top10s_retrieved)} [{progress:.1f}%]")
         for item in top10:

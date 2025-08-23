@@ -1,9 +1,8 @@
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
+import torch.nn as nn
 
 from dataset import save_emb
 
@@ -64,19 +63,51 @@ class FlashMultiHeadAttention(torch.nn.Module):
 
 
 class PointWiseFeedForward(torch.nn.Module):
+    """
+    使用SwiGLU激活函数的前馈网络
+    """
     def __init__(self, hidden_units, dropout_rate):
         super(PointWiseFeedForward, self).__init__()
-
-        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
-        self.relu = torch.nn.ReLU()
-        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
+        
+        # SwiGLU FFN参数
+        hidden_dim = int(2 * hidden_units / 3)
+        multiple_of = 256
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
+        # 使用Conv1D替代Linear层以提高效率
+        self.w1 = nn.Conv1d(hidden_units, hidden_dim, kernel_size=1, bias=False)
+        self.w2 = nn.Conv1d(hidden_dim, hidden_units, kernel_size=1, bias=False)
+        self.w3 = nn.Conv1d(hidden_units, hidden_dim, kernel_size=1, bias=False)
+        
+        # 使用两层dropout
+        self.dropout1 = torch.nn.Dropout(p=dropout_rate)  # 输入dropout
+        self.dropout2 = torch.nn.Dropout(p=dropout_rate)  # 输出dropout
 
     def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
-        return outputs
+        # inputs形状: [batch_size, seq_len, hidden_units]
+        # 转换为Conv1D需要的格式: [batch_size, hidden_units, seq_len]
+        inputs = inputs.transpose(-1, -2)
+        
+        # 在输入上应用dropout
+        inputs = self.dropout1(inputs)
+        
+        # SwiGLU激活函数: Swish(xW1) * (xW3)
+        x1 = self.w1(inputs)
+        x1 = F.silu(x1)  # Swish激活函数
+        
+        x3 = self.w3(inputs)
+        
+        # 元素级相乘
+        x = x1 * x3
+        
+        # 最终线性变换和输出dropout
+        output = self.w2(x)
+        output = self.dropout2(output)
+        
+        # 转换回原始格式: [batch_size, seq_len, hidden_units]
+        output = output.transpose(-1, -2)
+        
+        return output
 
 
 class BaselineModel(torch.nn.Module):
@@ -411,7 +442,7 @@ class BaselineModel(torch.nn.Module):
         """
         all_embs = []
 
-        for start_idx in tqdm(range(0, len(item_ids), batch_size), desc="Saving item embeddings"):
+        for idx, start_idx in enumerate(range(0, len(item_ids), batch_size)):
             end_idx = min(start_idx + batch_size, len(item_ids))
 
             item_seq = torch.tensor(item_ids[start_idx:end_idx], device=self.dev).unsqueeze(0)
@@ -424,9 +455,14 @@ class BaselineModel(torch.nn.Module):
             batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
+            
+            if idx % 10 == 0:
+                progress = (idx + 1) / (len(item_ids) // batch_size + (1 if len(item_ids) % batch_size else 0)) * 100
+                print(f"  Saving item embeddings: {idx+1}/{len(item_ids) // batch_size + (1 if len(item_ids) % batch_size else 0)} [{progress:.1f}%]")
 
         # 合并所有批次的结果并保存
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))
         save_emb(final_ids, Path(save_path, 'id.u64bin'))
+
