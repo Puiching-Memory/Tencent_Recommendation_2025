@@ -1,6 +1,7 @@
 import argparse
 import subprocess
 import sys
+import os
 
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "orjson"])
@@ -10,7 +11,6 @@ except subprocess.CalledProcessError:
     print("orjson安装失败，使用默认json库")
     import json
     
-import os
 import time
 from pathlib import Path
 
@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument('--maxlen', default=101, type=int, help='序列最大长度')
 
     # 模型结构参数
-    parser.add_argument('--hidden_units', default=64, type=int, help='隐藏层单元数')
+    parser.add_argument('--hidden_units', default=128, type=int, help='隐藏层单元数')
     parser.add_argument('--num_blocks', default=4, type=int, help='Transformer块的数量')
     parser.add_argument('--num_epochs', default=5, type=int, help='训练轮数')
     parser.add_argument('--num_heads', default=4, type=int, help='多头注意力机制中头的数量')
@@ -71,7 +71,7 @@ if __name__ == '__main__':
     Path(os.environ.get('TRAIN_TF_EVENTS_PATH')).mkdir(parents=True, exist_ok=True)
     
     # 打开日志文件并创建TensorBoard写入器
-    log_file = open(Path(os.environ.get('TRAIN_LOG_PATH'), 'train.log'), 'w')
+    log_file = open(Path(os.environ.get('TRAIN_LOG_PATH'), 'train.log'), 'wb')
     writer = SummaryWriter(os.environ.get('TRAIN_TF_EVENTS_PATH'))
     
     # 获取训练数据路径
@@ -265,7 +265,7 @@ if __name__ == '__main__':
                 **train_metrics,
                 'time': time.time()
             })
-            log_file.write(log_json + '\n')
+            log_file.write(log_json + b'\n')
             log_file.flush()
             
             # 每10步打印一次训练进度
@@ -317,6 +317,8 @@ if __name__ == '__main__':
         with torch.inference_mode():
             print("Validating...")
             for step, batch in enumerate(valid_loader):
+                step_start_time = time.time()
+                
                 # 从批次数据中提取各个组成部分
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
                 
@@ -351,6 +353,38 @@ if __name__ == '__main__':
                 valid_loss_sum += loss.item()
                 valid_bce_loss_sum += bce_loss.item()
                 valid_steps += 1
+                
+                step_time = time.time() - step_start_time
+                
+                # 计算验证速度和剩余时间
+                elapsed_valid_time = time.time() - valid_start_time
+                valid_steps_per_second = (step + 1) / elapsed_valid_time if elapsed_valid_time > 0 else 0
+                remaining_valid_steps = len(valid_loader) - (step + 1)
+                estimated_valid_remaining_time = remaining_valid_steps / valid_steps_per_second if valid_steps_per_second > 0 else 0
+                
+                # 收集验证指标数据
+                valid_metrics = {
+                    'loss': loss.item(),
+                    'bce_loss': bce_loss.item(),
+                    'step_time': step_time,
+                    'elapsed_time': elapsed_valid_time,
+                    'steps_per_second': valid_steps_per_second,
+                    'estimated_remaining_time': estimated_valid_remaining_time
+                }
+                
+                # 每10步打印一次验证进度
+                if step % 10 == 0:
+                    progress = (step + 1) / len(valid_loader) * 100
+                    print(f"  Valid Step {step+1}/{len(valid_loader)} [{progress:.1f}%] - "
+                          f"Loss: {valid_metrics['loss']:.4f}, "
+                          f"Speed: {valid_metrics['steps_per_second']:.2f} steps/s, "
+                          f"ETA: {format_time(valid_metrics['estimated_remaining_time'])}")
+                
+                # 将验证指标写入TensorBoard
+                writer.add_scalar('Valid/Loss', valid_metrics['loss'], global_step + step)
+                writer.add_scalar('Valid/Loss_BCE', valid_metrics['bce_loss'], global_step + step)
+                writer.add_scalar('Valid/Performance/step_time', valid_metrics['step_time'], global_step + step)
+                writer.add_scalar('Valid/Performance/steps_per_second', valid_metrics['steps_per_second'], global_step + step)
                 
         # 计算平均验证损失
         valid_time = time.time() - valid_start_time
