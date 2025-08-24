@@ -66,12 +66,6 @@ def print_system_info():
     except Exception as e:
         print(e)
 
-    try:
-        import ujson
-        print(f"ujson 版本: {ujson.__version__}")
-    except Exception as e:
-        print(e)
-
     print("=" * 50)
 
 def parse_data_path_structure(data_path):

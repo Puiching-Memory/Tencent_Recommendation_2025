@@ -1,5 +1,15 @@
 import argparse
-import json
+import subprocess
+import sys
+
+try:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "orjson"])
+    import orjson as json
+    print("orjson安装成功，使用orjson加载数据")
+except subprocess.CalledProcessError:
+    print("orjson安装失败，使用默认json库")
+    import json
+    
 import os
 import time
 from pathlib import Path
@@ -116,8 +126,8 @@ if __name__ == '__main__':
     for name, param in model.named_parameters():
         try:
             torch.nn.init.xavier_normal_(param.data)
-        except Exception:
-            pass
+        except Exception as e:
+            print(e)
 
     # 将特殊标记（padding）的嵌入向量初始化为0
     model.pos_emb.weight.data[0, :] = 0
