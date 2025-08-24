@@ -7,10 +7,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
 from model import GenerativeRecommender
-
+from hstu import HSTUModel  # 添加HSTU模型导入
+from utils import parse_data_path_structure
 
 def get_ckpt_path():
     ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
@@ -24,21 +26,27 @@ def get_ckpt_path():
 def get_args():
     parser = argparse.ArgumentParser()
 
-    # Train params
+    # Inference params
     parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
-    # Baseline Model construction
-    parser.add_argument('--embedding_dim', default=64, type=int)
-    parser.add_argument('--num_layers', default=2, type=int)
+    # HSTU Model construction
+    parser.add_argument('--hidden_units', default=64, type=int)
+    parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_heads', default=4, type=int)
-    parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--dropout_rate', default=0.01, type=float)
-    parser.add_argument('--l2_emb', default=0.001, type=float)
+    parser.add_argument('--dropout_rate', default=0.03, type=float)
+    parser.add_argument('--norm_first', action='store_true', help='Enable normalization first in transformer layers', default=False)
     parser.add_argument('--device', default='cuda', type=str)
-    parser.add_argument('--inference_only', action='store_true')
-    parser.add_argument('--state_dict_path', default=None, type=str)
+
+    # 新增：模型类型选择
+    parser.add_argument('--model_type', default='hstu', type=str, choices=['generative', 'hstu'],
+                        help='选择要使用的模型类型: generative(生成式模型) 或 hstu(HSTU模型)')
+
+    # Acceleration options for inference
+    parser.add_argument('--use_amp', action='store_true', help='Enable automatic mixed precision (AMP)',default=True)
+    parser.add_argument('--use_torch_compile', action='store_true', help='Enable torch.compile for model optimization',default=True)
+    parser.add_argument('--use_cudnn_benchmark', action='store_true', help='Enable cuDNN benchmark for performance',default=True)
+    parser.add_argument('--use_tf32', action='store_true', help='Enable TF32 for faster float32 computations',default=True)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -97,13 +105,15 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
         mm_emb_dict: 多模态特征字典
         model: 模型
     Returns:
-        retrieve_id2creative_id: 索引id->creative_id的dict
+        retrieve_id2creative_id: 检索ID到creative_id的映射
     """
     EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-    candidate_path = Path(os.environ.get('EVAL_DATA_PATH'), 'predict_set.jsonl')
-    item_ids, creative_ids, retrieval_ids, features = [], [], [], []
+    candidate_path = os.path.join(os.environ.get('EVAL_DATA_PATH'), "candidate.jsonl")
+    item_ids = []
+    creative_ids = []
+    retrieval_ids = []
+    features = []
     retrieve_id2creative_id = {}
-
     with open(candidate_path, 'r') as f:
         for line in f:
             line = json.loads(line)
@@ -142,70 +152,65 @@ def infer():
     data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=test_dataset.collate_fn, pin_memory=True
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
-    model = GenerativeRecommender(
-        num_users=usernum,
-        num_items=itemnum,
-        embedding_dim=args.embedding_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        dropout_rate=args.dropout_rate,
-        maxlen=args.maxlen,
-        feat_statistics=feat_statistics,
-        feat_types=feat_types
-    ).to(args.device)
+    
+    # 根据选择的模型类型创建相应模型
+    if args.model_type == 'generative':
+        print("使用生成式模型 (GenerativeRecommender)")
+        model = GenerativeRecommender(
+            num_users=usernum+1,
+            num_items=itemnum+1,
+            embedding_dim=args.hidden_units,
+            modalities_emb_dims=[32, 1024, 3584, 4096, 3584, 3584],  # 根据MM特征维度设置
+            latent_dim=args.hidden_units,
+            num_codebooks=4,
+            codebook_size=64
+        ).to(args.device)
+    elif args.model_type == 'hstu':
+        print("使用HSTU模型 (HSTUModel)")
+        model = HSTUModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+
     model.eval()
+
+    # Compile model if enabled
+    if args.use_torch_compile:
+        model = torch.compile(model)
+        print("Model compiled with torch.compile")
 
     ckpt_path = get_ckpt_path()
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
     all_embs = []
     user_list = []
-    for step, batch in enumerate(test_loader):
-
-        seq, token_type, seq_feat, user_id = batch
+    for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
+        seq, token_type, seq_feat, user = batch
         seq = seq.to(args.device)
-        logits = model.predict(seq, seq_feat, token_type)
-        for i in range(logits.shape[0]):
-            emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
-            all_embs.append(emb)
-        user_list += user_id
+        with torch.no_grad():
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    if args.model_type == 'generative':
+                        user_emb = model.predict(seq, seq_feat, token_type)
+                    elif args.model_type == 'hstu':
+                        user_emb = model.predict(seq, seq_feat, token_type)
+            else:
+                if args.model_type == 'generative':
+                    user_emb = model.predict(seq, seq_feat, token_type)
+                elif args.model_type == 'hstu':
+                    user_emb = model.predict(seq, seq_feat, token_type)
+        all_embs.append(user_emb.cpu().numpy())
+        user_list.extend(user)
 
-    # 生成候选库的embedding 以及 id文件
-    retrieve_id2creative_id = get_candidate_emb(
-        test_dataset.indexer['i'],
-        test_dataset.feature_types,
-        test_dataset.feature_default_value,
-        test_dataset.mm_emb_dict,
-        model,
-    )
-    all_embs = np.concatenate(all_embs, axis=0)
-    # 保存query文件
-    save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
-    # ANN 检索
-    ann_cmd = (
-        str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
-        + " --dataset_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin"))
-        + " --dataset_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin"))
-        + " --query_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "query.fbin"))
-        + " --result_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-        + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
-    )
-    os.system(ann_cmd)
+    all_embs = np.vstack(all_embs)
 
-    # 取出top-k
-    top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-    top10s_untrimmed = []
-    for top10 in top10s_retrieved:
-        for item in top10:
-            top10s_untrimmed.append(retrieve_id2creative_id.get(int(item), 0))
+    save_path = Path(os.environ.get('EVAL_RESULT_PATH'))
+    save_path.mkdir(parents=True, exist_ok=True)
+    save_emb(all_embs, Path(save_path, 'embedding.fbin'))
+    with open(Path(save_path, 'id.txt'), 'w') as f:
+        for user_id in user_list:
+            f.write(str(user_id) + '\n')
 
-    top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
 
-    return top10s, user_list
+if __name__ == '__main__':
+    infer()

@@ -1,52 +1,112 @@
-from pathlib import Path
+"""
+基于论文"Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations"的HSTU模型实现
+该实现适配了当前项目的特征处理和数据格式
+"""
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 
 from dataset import save_emb
 
 
-class FlashMultiHeadAttention(torch.nn.Module):
+class HSTUAttention(torch.nn.Module):
+    """
+    HSTU中的注意力机制实现，基于论文"Actions Speak Louder than Words: 
+    Trillion-Parameter Sequential Transducers for Generative Recommendations"
+    """
     def __init__(self, hidden_units, num_heads, dropout_rate):
-        super(FlashMultiHeadAttention, self).__init__()
-
+        super(HSTUAttention, self).__init__()
+        
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-
+        self.scale = self.head_dim ** -0.5
+        
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
-
+        
         self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
-
+        
     def forward(self, query, key, value, attn_mask=None):
         batch_size, seq_len, _ = query.size()
-
+        
         # 计算Q, K, V
         Q = self.q_linear(query)
         K = self.k_linear(key)
         V = self.v_linear(value)
-
+        
         # reshape为multi-head格式
         Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_output = F.scaled_dot_product_attention(
-            Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
-        )
-
+        
+        # 使用PyTorch内置的scaled_dot_product_attention（支持FlashAttention）
+        if hasattr(F, 'scaled_dot_product_attention'):
+            attn_output = F.scaled_dot_product_attention(
+                Q, K, V, 
+                dropout_p=self.dropout_rate if self.training else 0.0, 
+                attn_mask=attn_mask.unsqueeze(1) if attn_mask is not None else None
+            )
+        else:
+            # 降级到标准注意力机制实现
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+            
+            if attn_mask is not None:
+                scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
+            
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.dropout(attn_weights, p=self.dropout_rate if self.training else 0.0)
+            attn_output = torch.matmul(attn_weights, V)
+        
         # reshape回原来的格式
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-
+        
         # 最终的线性变换
         output = self.out_linear(attn_output)
+        
+        return output
 
-        return output, None
+
+class HSTULayer(torch.nn.Module):
+    """
+    HSTU的基本层，包含注意力机制和前馈网络
+    """
+    def __init__(self, hidden_units, num_heads, dropout_rate, ff_dim=None):
+        super(HSTULayer, self).__init__()
+        
+        self.hidden_units = hidden_units
+        if ff_dim is None:
+            ff_dim = 4 * hidden_units
+            
+        # 注意力机制
+        self.attention = HSTUAttention(hidden_units, num_heads, dropout_rate)
+        self.attn_layer_norm = torch.nn.LayerNorm(hidden_units)
+        
+        # 前馈网络
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(hidden_units, ff_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout_rate),
+            torch.nn.Linear(ff_dim, hidden_units),
+            torch.nn.Dropout(dropout_rate)
+        )
+        self.ffn_layer_norm = torch.nn.LayerNorm(hidden_units)
+        
+    def forward(self, x, mask=None):
+        # 注意力子层
+        attn_output = self.attention(x, x, x, mask)
+        x = self.attn_layer_norm(x + attn_output)
+        
+        # 前馈子层
+        ffn_output = self.ffn(x)
+        x = self.ffn_layer_norm(x + ffn_output)
+        
+        return x
 
 
 class PackedSwiGLUFFN(torch.nn.Module):
@@ -84,21 +144,15 @@ class PackedSwiGLUFFN(torch.nn.Module):
         return self.w2(F.silu(x1) * x3)
 
 
-class BaselineModel(torch.nn.Module):
+class HSTUModel(torch.nn.Module):
     """
-    Args:
-        user_num: 用户数量
-        item_num: 物品数量
-        feat_statistics: 特征统计信息，key为特征ID，value为特征数量
-        feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
-        args: 全局参数
-
+    基于Hierarchical Sequential Transduction Unit的生成式推荐模型
+    
+    该模型采用HSTU架构处理用户行为序列，通过自注意力机制捕获序列中的长期依赖关系，
+    并利用多层HSTU层逐步提取更高层次的序列表示。该实现基于论文"Actions Speak Louder than Words: 
+    Trillion-Parameter Sequential Transducers for Generative Recommendations"。
+    
     Attributes:
-        user_num: 用户数量
-        item_num: 物品数量
-        dev: 设备
-        norm_first: 是否先归一化
-        maxlen: 序列最大长度
         item_emb: Item Embedding Table
         user_emb: User Embedding Table
         sparse_emb: 稀疏特征Embedding Table
@@ -106,33 +160,26 @@ class BaselineModel(torch.nn.Module):
         userdnn: 用户特征拼接后经过的全连接层
         itemdnn: 物品特征拼接后经过的全连接层
     """
-
-    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
-        super(BaselineModel, self).__init__()
-
+    
+    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
+        super(HSTUModel, self).__init__()
+        
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         self.args = args
-        # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
-
+        
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
         self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-
-        self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
-        self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
-
+        
         self._init_feat_info(feat_statistics, feat_types)
-
+        
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
         )
@@ -141,28 +188,31 @@ class BaselineModel(torch.nn.Module):
             + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
-
+        
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
-
+        
+        # HSTU层
+        self.hstu_layers = torch.nn.ModuleList()
+        self.forward_layernorms = torch.nn.ModuleList()
+        self.forward_layers = torch.nn.ModuleList()
+        
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-
+        
         for _ in range(args.num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
-
-            new_attn_layer = FlashMultiHeadAttention(
+            new_hstu_layer = HSTULayer(
                 args.hidden_units, args.num_heads, args.dropout_rate
-            )  # 优化：用FlashAttention替代标准Attention
-            self.attention_layers.append(new_attn_layer)
-
+            )
+            self.hstu_layers.append(new_hstu_layer)
+            
             new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
             self.forward_layernorms.append(new_fwd_layernorm)
-
+            
             # 使用PackedSwiGLUFFN替换原有的PointWiseFeedForward
             new_fwd_layer = PackedSwiGLUFFN(args.hidden_units, device=args.device)
             self.forward_layers.append(new_fwd_layer)
-
+        
+        # 初始化嵌入层
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
@@ -173,7 +223,7 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-
+            
     def _init_feat_info(self, feat_statistics, feat_types):
         """
         将特征统计信息（特征数量）按特征类型分组产生不同的字典，方便声明稀疏特征的Embedding Table
@@ -368,18 +418,17 @@ class BaselineModel(torch.nn.Module):
         attention_mask_pad = (mask != 0).unsqueeze(1).expand(-1, maxlen, -1)
         attention_mask = attention_mask_tril & attention_mask_pad
 
-        # Transformer编码器层
-        for i in range(len(self.attention_layers)):
+        # HSTU编码器层
+        for i in range(len(self.hstu_layers)):
             if self.norm_first:
                 # Pre-LN架构
-                x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
-                seqs = seqs + mha_outputs
+                x = self.hstu_layers[i](seqs, attn_mask=attention_mask)
+                seqs = seqs + x
                 seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
                 # Post-LN架构
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
+                x = self.hstu_layers[i](seqs, attn_mask=attention_mask)
+                seqs = self.hstu_layers[i](seqs + x)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
         log_feats = self.last_layernorm(seqs)

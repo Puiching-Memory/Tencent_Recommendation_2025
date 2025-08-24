@@ -2,6 +2,9 @@ import json
 import pickle
 import struct
 from pathlib import Path
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import time
 
 import numpy as np
 import torch
@@ -445,28 +448,68 @@ def load_mm_emb(mm_path, feat_ids):
     Returns:
         mm_emb_dict: 多模态特征Embedding字典，key为特征ID，value为特征Embedding字典（key为item ID，value为Embedding）
     """
+    start_time = time.time()
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
-    for feat_id in feat_ids:
-        shape = SHAPE_DICT[feat_id]
-        emb_dict = {}
-        if feat_id != '81':
-            try:
-                base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*.json'):
-                    with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
-                            data_dict_origin = json.loads(line.strip())
-                            insert_emb = data_dict_origin['emb']
-                            if isinstance(insert_emb, list):
-                                insert_emb = np.array(insert_emb, dtype=np.float32)
-                            data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
-                            emb_dict.update(data_dict)
-            except Exception as e:
-                print(f"transfer error: {e}")
-        if feat_id == '81':
-            with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
-                emb_dict = pickle.load(f)
-        mm_emb_dict[feat_id] = emb_dict
-        print(f'Loaded #{feat_id} mm_emb')
+
+    # 使用进程池并行加载不同的特征ID
+    with ProcessPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
+        # 提交所有任务
+        future_to_feat = {
+            executor.submit(_load_single_feat_emb, mm_path, feat_id, SHAPE_DICT[feat_id]): feat_id 
+            for feat_id in feat_ids
+        }
+        
+        # 收集结果
+        for future in as_completed(future_to_feat):
+            feat_id, emb_dict = future.result()
+            mm_emb_dict[feat_id] = emb_dict
+    
+    elapsed_time = time.time() - start_time
+    print(f"Loaded all mm_emb in {elapsed_time:.2f} seconds")
     return mm_emb_dict
+
+
+def _load_single_feat_emb(mm_path, feat_id, shape):
+    """
+    加载单个特征ID的Embedding
+    
+    Args:
+        mm_path: 多模态特征Embedding路径
+        feat_id: 特征ID
+        shape: 特征维度
+        
+    Returns:
+        feat_id: 特征ID
+        emb_dict: 特征Embedding字典
+    """
+    emb_dict = {}
+    if feat_id != '81':
+        try:
+            base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
+            json_files = list(base_path.glob('*.json'))
+            print(f"Loading feature {feat_id} from {len(json_files)} files")
+            
+            total_line_count = 0
+            for i, json_file in enumerate(json_files):
+                with open(json_file, 'r', encoding='utf-8') as file:
+                    line_count = 0
+                    for line in file:
+                        data_dict_origin = json.loads(line.strip())
+                        insert_emb = data_dict_origin['emb']
+                        if isinstance(insert_emb, list):
+                            insert_emb = np.array(insert_emb, dtype=np.float32)
+                        data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
+                        emb_dict.update(data_dict)
+                        line_count += 1
+                    total_line_count += line_count
+                    # 每处理100个文件或者处理完所有文件时打印一次进度
+                    if (i + 1) % 100 == 0 or (i + 1) == len(json_files):
+                        print(f"  Processed {i + 1}/{len(json_files)} files for feature {feat_id}")
+        except Exception as e:
+            print(f"transfer error: {e}")
+    if feat_id == '81':
+        with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
+            emb_dict = pickle.load(f)
+    print(f'Loaded #{feat_id} mm_emb with {len(emb_dict)} embeddings')
+    return feat_id, emb_dict

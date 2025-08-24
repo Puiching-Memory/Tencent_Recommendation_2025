@@ -293,8 +293,10 @@ class BaselineModel(torch.nn.Module):
                         batch_emb_data[i, j] = item[k]
 
             # batch-convert and transfer to GPU
-            tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
-            item_feat_list.append(self.emb_transform[k](tensor_feature))
+            tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)  # 确保张量在正确的设备上
+            transformed_feature = self.emb_transform[k](tensor_feature)
+            # 确保变换后的张量也在正确的设备上
+            item_feat_list.append(transformed_feature.to(self.dev))
 
         # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)

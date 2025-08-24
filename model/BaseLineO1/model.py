@@ -68,7 +68,7 @@ class PointWiseFeedForward(torch.nn.Module):
 
         self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
         self.dropout1 = torch.nn.Dropout(p=dropout_rate)
-        self.relu = torch.nn.ReLU()
+        self.relu = torch.nn.GELU()
         self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
         self.dropout2 = torch.nn.Dropout(p=dropout_rate)
 

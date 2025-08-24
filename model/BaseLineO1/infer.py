@@ -28,10 +28,11 @@ def get_args():
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--hidden_units', default=64, type=int)
+    parser.add_argument('--hidden_units', default=32, type=int)
     parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_heads', default=4, type=int)
-    parser.add_argument('--dropout_rate', default=0.2, type=float)
+    parser.add_argument('--dropout_rate', default=0.03, type=float)
+    parser.add_argument('--norm_first', action='store_true', help='Enable normalization first in transformer layers', default=False)
     parser.add_argument('--device', default='cuda', type=str)
 
     # Acceleration options for inference
