@@ -80,7 +80,29 @@ class MyDataset(torch.utils.data.Dataset):
         加载用户行为序列数据文件和偏移量索引文件
         偏移量文件用于快速定位和读取特定用户的数据，避免全文件扫描
         """
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
+        # 加载偏移量索引
+        with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
+            self.seq_offsets = pickle.load(f)
+        
+        # 将文件内容预加载到内存中，防止多进程访问冲突
+        with open(self.data_dir / "seq.jsonl", 'rb') as f:
+            file_content = f.read()
+        
+        # 根据偏移量预加载所有用户数据到内存中
+        self.user_data = {}
+        for idx, offset in enumerate(self.seq_offsets):
+            # 定位到偏移量位置并读取一行
+            start_pos = offset
+            # 查找行结束符
+            end_pos = file_content.find(b'\n', start_pos)
+            if end_pos == -1:  # 最后一行可能没有换行符
+                line = file_content[start_pos:]
+            else:
+                line = file_content[start_pos:end_pos + 1]
+            # 使用索引作为键，与__getitem__方法中传入的uid对应
+            self.user_data[idx] = line
+        
+        # 加载偏移量索引
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
 
@@ -94,8 +116,7 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             list: 用户行为序列数据，每个元素为(用户ID,物品ID,用户特征,物品特征,行为类型,时间戳)元组
         """
-        self.data_file.seek(self.seq_offsets[uid])
-        line = self.data_file.readline()
+        line = self.user_data[uid]
         data = json.loads(line)
         return data
 
@@ -346,10 +367,28 @@ class MyTestDataset(MyDataset):
         """
         加载测试数据文件和偏移量索引文件
         """
-        self.data_file = open(self.data_dir / "predict_seq.jsonl", 'rb')
+        # 加载偏移量索引
         with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
-
+        
+        # 将文件内容预加载到内存中，防止多进程访问冲突
+        with open(self.data_dir / "predict_seq.jsonl", 'rb') as f:
+            file_content = f.read()
+        
+        # 根据偏移量预加载所有用户数据到内存中
+        self.user_data = {}
+        for idx, offset in enumerate(self.seq_offsets):
+            # 定位到偏移量位置并读取一行
+            start_pos = offset
+            # 查找行结束符
+            end_pos = file_content.find(b'\n', start_pos)
+            if end_pos == -1:  # 最后一行可能没有换行符
+                line = file_content[start_pos:]
+            else:
+                line = file_content[start_pos:end_pos + 1]
+            # 使用索引作为键，与__getitem__方法中传入的uid对应
+            self.user_data[idx] = line
+            
     def _process_cold_start_feat(self, feat):
         """
         处理冷启动问题中的特征缺失

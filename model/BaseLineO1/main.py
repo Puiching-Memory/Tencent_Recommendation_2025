@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import MyDataset
+from dataset import MyDataset, MyDataset
 from model import BaselineModel
 from utils import print_system_info, format_time, parse_data_path_structure
 
@@ -34,17 +34,17 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # 训练参数配置
-    parser.add_argument('--batch_size', default=128, type=int, help='每个批次的样本数量')
-    parser.add_argument('--lr', default=0.001, type=float, help='学习率，控制模型参数更新的步长')
+    parser.add_argument('--batch_size', default=128, type=int)  # 减小批次大小以节省显存
+    parser.add_argument('--lr', default=0.005, type=float, help='学习率，控制模型参数更新的步长')
     parser.add_argument('--maxlen', default=101, type=int, help='序列最大长度')
 
     # 模型结构参数
-    parser.add_argument('--hidden_units', default=128, type=int, help='隐藏层单元数')
+    parser.add_argument('--hidden_units', default=64, type=int, help='隐藏层单元数')
     parser.add_argument('--num_blocks', default=4, type=int, help='Transformer块的数量')
     parser.add_argument('--num_epochs', default=5, type=int, help='训练轮数')
-    parser.add_argument('--num_heads', default=4, type=int, help='多头注意力机制中头的数量')
-    parser.add_argument('--dropout_rate', default=0.05, type=float, help='Dropout概率，用于防止过拟合')
-    parser.add_argument('--l2_emb', default=0.001, type=float, help='L2正则化系数')
+    parser.add_argument('--num_heads', default=1, type=int, help='多头注意力机制中头的数量')
+    parser.add_argument('--dropout_rate', default=0.01, type=float, help='Dropout概率，用于防止过拟合')
+    parser.add_argument('--l2_emb', default=0.01, type=float, help='L2正则化系数')
     parser.add_argument('--device', default='cuda', type=str, help='训练设备，可选cuda或cpu')
     parser.add_argument('--inference_only', action='store_true', help='是否仅进行推理（验证/测试）')
     parser.add_argument('--state_dict_path', default=None, type=str, help='预训练模型权重文件路径')
@@ -55,6 +55,7 @@ def get_args():
     parser.add_argument('--use_torch_compile', action='store_true', help='启用torch.compile优化模型执行')
     parser.add_argument('--use_cudnn_benchmark', action='store_true', help='启用cuDNN基准测试模式，优化卷积计算')
     parser.add_argument('--use_tf32', action='store_true', help='启用TF32格式，提升float32计算性能')
+    parser.add_argument('--num_workers', default=0, type=int, help='数据加载器使用的进程数')
 
     # 多模态特征ID配置
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)],
@@ -98,21 +99,26 @@ if __name__ == '__main__':
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     
-    # 根据配置决定是否编译数据加载器的collate函数
-    if args.use_torch_compile:
-        train_collate_fn = torch.compile(dataset.collate_fn, mode="reduce-overhead")
-        valid_collate_fn = torch.compile(dataset.collate_fn, mode="reduce-overhead")
-        print("DataLoader collate functions compiled with torch.compile")
-    else:
-        train_collate_fn = dataset.collate_fn
-        valid_collate_fn = dataset.collate_fn
-    
     # 创建训练和验证数据加载器
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=train_collate_fn
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers, 
+        collate_fn=MyDataset.collate_fn, 
+        persistent_workers=args.num_workers > 0,
+        drop_last=True,
+        pin_memory=True
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=valid_collate_fn
+        valid_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers, 
+        collate_fn=MyDataset.collate_fn, 
+        persistent_workers=args.num_workers > 0, 
+        drop_last=True, 
+        pin_memory=True
     )
     
     # 获取用户数、物品数以及特征统计信息
@@ -122,18 +128,24 @@ if __name__ == '__main__':
     # 初始化模型并移动到指定设备
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
-    # 对模型参数进行Xavier初始化
+    # 对模型参数进行Xavier初始化，但要避免对维度不足的参数进行初始化
     for name, param in model.named_parameters():
         try:
-            torch.nn.init.xavier_normal_(param.data)
+            # 只对维度大于等于2的参数进行Xavier初始化
+            if param.dim() >= 2:
+                torch.nn.init.xavier_normal_(param.data)
+            elif param.dim() == 1:
+                # 对一维参数（如偏置项）进行常量初始化
+                torch.nn.init.constant_(param.data, 0.0)
         except Exception as e:
-            print(e)
+            print(f"Warning: Failed to initialize parameter {name}: {e}")
 
     # 将特殊标记（padding）的嵌入向量初始化为0
     model.pos_emb.weight.data[0, :] = 0
     model.item_emb.weight.data[0, :] = 0
     model.user_emb.weight.data[0, :] = 0
 
+    # 初始化稀疏特征嵌入的padding为0
     for k in model.sparse_emb:
         model.sparse_emb[k].weight.data[0, :] = 0
 

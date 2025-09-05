@@ -91,11 +91,17 @@ if __name__ == '__main__':
 
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
+    # 对模型参数进行Xavier初始化，但要避免对维度不足的参数进行初始化
     for name, param in model.named_parameters():
         try:
-            torch.nn.init.xavier_normal_(param.data)
-        except Exception:
-            pass
+            # 只对维度大于等于2的参数进行Xavier初始化
+            if param.dim() >= 2:
+                torch.nn.init.xavier_normal_(param.data)
+            elif param.dim() == 1:
+                # 对一维参数（如偏置项）进行常量初始化
+                torch.nn.init.constant_(param.data, 0.0)
+        except Exception as e:
+            print(f"Warning: Failed to initialize parameter {name}: {e}")
 
     model.pos_emb.weight.data[0, :] = 0
     model.item_emb.weight.data[0, :] = 0

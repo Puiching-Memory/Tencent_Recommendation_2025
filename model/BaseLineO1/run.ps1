@@ -20,4 +20,4 @@ Write-Host "TRAIN_CKPT_PATH: $env:TRAIN_CKPT_PATH"
 Set-Location $ScriptDir
 
 # 运行python脚本
-python -u main.py --use_amp --use_torch_compile --use_cudnn_benchmark --use_tf32 --batch_size 2
+python -u main.py --use_amp --use_torch_compile --use_cudnn_benchmark --use_tf32 --batch_size 8 --num_workers 1
