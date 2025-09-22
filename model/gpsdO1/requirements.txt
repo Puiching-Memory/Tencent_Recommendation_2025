@@ -1,5 +1,0 @@
-tqdm
-loguru
-torchmetrics
-faiss-cpu
-adamw_bf16
